@@ -24,6 +24,8 @@ import random
 import logging
 import tempfile
 import itertools
+import contextvars
+from functools import wraps
 from datetime import datetime
 
 # aiohttp and edge_tts lazy-loaded on first use — faster startup
@@ -81,6 +83,26 @@ if os.path.exists('extra_bots.txt'):
             if _t and _t not in TOKENS:
                 TOKENS.append(_t)
 
+# Bots added with /clone are stored with their Telegram owner.  Tokens are
+# intentionally never printed or included in status/error messages.
+CLONED_BOTS_FILE = 'cloned_bots.json'
+CLONE_OWNERS = {}  # {bot_id: Telegram user_id that supplied the token}
+
+try:
+    if os.path.exists(CLONED_BOTS_FILE):
+        with open(CLONED_BOTS_FILE) as _f:
+            _cloned_data = json.load(_f)
+        for _record in _cloned_data.get('bots', []):
+            _token = str(_record.get('token', '')).strip()
+            _bot_id = int(_record.get('bot_id', 0))
+            _owner_id = int(_record.get('owner_id', 0))
+            if _token and _bot_id and _owner_id:
+                if _token not in TOKENS:
+                    TOKENS.append(_token)
+                CLONE_OWNERS[_bot_id] = _owner_id
+except (OSError, ValueError, TypeError, json.JSONDecodeError) as _e:
+    logging.error('Could not load cloned bots: %s', type(_e).__name__)
+
 if not TOKENS:
     raise SystemExit('ERROR: No bot tokens found!')
 
@@ -118,7 +140,8 @@ AI_HISTORY = {}
 # ===========================================================
 # OWNER & SUDO CONFIG
 # ===========================================================
-OWNER_ID = int(os.getenv('OWNER_ID', '8743164329', '7965536779'))
+OWNER_ID = int(os.getenv('OWNER_ID', '8743164329'))
+MAX_CLONED_BOTS = max(1, int(os.getenv('MAX_CLONED_BOTS', '20')))
 SUDO_FILE = "sudo_users.json"
 
 if os.path.exists(SUDO_FILE):
@@ -134,8 +157,38 @@ def save_sudo():
 # ===========================================================
 # GLOBAL STATE
 # ===========================================================
+# A clone owner may control only the bot they cloned.  The context variable
+# lets the existing command implementations keep iterating over ``bots``
+# while presenting a one-bot view for clone owners.  The main owner and sudo
+# users retain the original all-bot behaviour.
+_BOT_SCOPE = contextvars.ContextVar('bot_scope', default=None)
+
+
+def _safe_bot_id(bot):
+    try:
+        return bot.id
+    except (AttributeError, RuntimeError):
+        return None
+
+
+class _ScopedBotList(list):
+    def __iter__(self):
+        allowed_ids = _BOT_SCOPE.get()
+        iterator = list.__iter__(self)
+        if allowed_ids is None:
+            return iterator
+        return (bot for bot in iterator if _safe_bot_id(bot) in allowed_ids)
+
+    def __len__(self):
+        allowed_ids = _BOT_SCOPE.get()
+        if allowed_ids is None:
+            return list.__len__(self)
+        return sum(1 for bot in list.__iter__(self)
+                   if _safe_bot_id(bot) in allowed_ids)
+
+
 apps = []
-bots = []
+bots = _ScopedBotList()
 nc_tasks = {}
 spam_tasks = {}
 slider_tasks = {}
@@ -252,10 +305,33 @@ BOT_START_TIME = datetime.now()
 # ===========================================================
 # PERMISSION HELPERS
 # ===========================================================
-def is_owner_or_sudo(uid):
+def _is_global_operator(uid):
     return uid == OWNER_ID or uid in SUDO_USERS
 
+
+def _context_bot_id(context):
+    try:
+        return context.bot.id
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def is_owner_or_sudo(uid, bot_id=None):
+    """Authorize global operators or the owner of this particular clone."""
+    return _is_global_operator(uid) or (
+        bot_id is not None and CLONE_OWNERS.get(bot_id) == uid
+    )
+
+
+def _set_clone_scope(uid, bot_id):
+    """Limit clone owners to their bot; return a token for later reset."""
+    if bot_id is not None and not _is_global_operator(uid):
+        return _BOT_SCOPE.set(frozenset({bot_id}))
+    return None
+
+
 def owner_only(func):
+    @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id == OWNER_ID:
             return await func(update, context)
@@ -268,11 +344,22 @@ def owner_only(func):
         )
     return wrapper
 
+
 def sudo_only(func):
+    @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if is_owner_or_sudo(update.effective_user.id):
+        uid = update.effective_user.id
+        bot_id = _context_bot_id(context)
+        if not is_owner_or_sudo(uid, bot_id):
+            await update.message.reply_text(NON_SUDO_MSG)
+            return
+
+        scope_token = _set_clone_scope(uid, bot_id)
+        try:
             return await func(update, context)
-        await update.message.reply_text(NON_SUDO_MSG)
+        finally:
+            if scope_token is not None:
+                _BOT_SCOPE.reset(scope_token)
     return wrapper
 
 async def _gcnclock_mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -309,22 +396,31 @@ async def _gcnclock_mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def nc_only(func):
     """NC guard: normal sudo check + gcnclock enforcement when active."""
+    @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
+        bot_id = _context_bot_id(context)
         cid = update.effective_chat.id if update.effective_chat else None
-        if not is_owner_or_sudo(uid):
+        if not is_owner_or_sudo(uid, bot_id):
             await update.message.reply_text(NON_SUDO_MSG)
             return
-        # gcnclock check: if locked, only owner OR one of the bot IDs allowed
-        if cid and cid in gcnc_locked and not _is_nc_allowed(uid):
-            await _gcnclock_mute_user(update, context)
-            return
-        return await func(update, context)
+
+        scope_token = _set_clone_scope(uid, bot_id)
+        try:
+            # When locked, only an authorized owner or one of our bots may run NC.
+            if cid and cid in gcnc_locked and not _is_nc_allowed(uid, bot_id):
+                await _gcnclock_mute_user(update, context)
+                return
+            return await func(update, context)
+        finally:
+            if scope_token is not None:
+                _BOT_SCOPE.reset(scope_token)
     return wrapper
 
-def _is_nc_allowed(uid: int) -> bool:
-    """True if uid is OWNER or one of the running bot user IDs."""
-    if uid == OWNER_ID:
+
+def _is_nc_allowed(uid: int, bot_id=None) -> bool:
+    """True for an authorized owner or one of the running bot user IDs."""
+    if is_owner_or_sudo(uid, bot_id):
         return True
     for b in bots:
         try:
@@ -1291,7 +1387,7 @@ NC_LOOP_REGISTRY.update({
     'flowernc_loop': flowernc_loop, 'namenc_loop': namenc_loop,
     'wizard_loop': wizard_loop,     'whitenc_loop': whitenc_loop,
     'blacknc_loop': blacknc_loop,   'flagemo_loop': flagemo_loop,
-    'goodncraid_loop': goodncraid_loop, 'mync_loop': mync_loop,
+    'goodncraid_loop': goodncraid_loop,
 })
 
 # ===========================================================
@@ -1760,6 +1856,8 @@ async def myspam(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mync_loop(bot, chat_id, text):
     await _nc_master_loop(bot, chat_id, _build_nc_titles(CUSTOM_NC_FRAMES, text))
 
+NC_LOOP_REGISTRY['mync_loop'] = mync_loop
+
 @nc_only
 async def mync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -1833,7 +1931,188 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ===========================================================
-# ADD TOKEN — /addtoken (owner only)
+# DYNAMIC BOT CLONING — /clone <token> (private chat only)
+# ===========================================================
+_BOT_TOKEN_RE = re.compile(r'^\d{6,20}:[A-Za-z0-9_-]{30,}$')
+_clone_lock = None
+
+
+class CloneBotError(Exception):
+    """An expected clone failure with a token-safe user-facing message."""
+
+
+async def _shutdown_cloned_app(app):
+    """Best-effort cleanup for an application that failed during startup."""
+    try:
+        if app.updater and app.updater.running:
+            await app.updater.stop()
+    except Exception:
+        pass
+    try:
+        if app.running:
+            await app.stop()
+    except Exception:
+        pass
+    try:
+        await app.shutdown()
+    except Exception:
+        pass
+
+
+def _persist_cloned_bot(token, bot_id, owner_id):
+    """Atomically persist one clone without ever logging its bot token."""
+    records = []
+    if os.path.exists(CLONED_BOTS_FILE):
+        with open(CLONED_BOTS_FILE) as clone_file:
+            data = json.load(clone_file)
+        records = data.get('bots', [])
+        if not isinstance(records, list):
+            records = []
+
+    records = [
+        record for record in records
+        if str(record.get('token', '')).strip() != token
+        and int(record.get('bot_id', 0)) != bot_id
+    ]
+    records.append({
+        'token': token,
+        'bot_id': bot_id,
+        'owner_id': owner_id,
+        'created_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+    })
+
+    temp_path = CLONED_BOTS_FILE + '.tmp'
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as clone_file:
+            json.dump({'bots': records}, clone_file, indent=2)
+        os.replace(temp_path, CLONED_BOTS_FILE)
+        try:
+            os.chmod(CLONED_BOTS_FILE, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+async def start_cloned_bot(token, owner_id):
+    """Validate, start polling, and persist a new bot without a restart."""
+    global _clone_lock
+    if _clone_lock is None:
+        _clone_lock = asyncio.Lock()
+
+    async with _clone_lock:
+        if token in TOKENS:
+            raise CloneBotError('⚠️ Ye bot pehle se hosted hai.')
+        if len(CLONE_OWNERS) >= MAX_CLONED_BOTS:
+            raise CloneBotError('❌ Abhi clone hosting capacity full hai.')
+
+        try:
+            app = build_app(token)
+        except Exception as exc:
+            logging.error('Clone build failed: %s', type(exc).__name__)
+            raise CloneBotError('❌ Token valid nahi hai.') from None
+
+        try:
+            # initialize() calls getMe, so an invalid/revoked token fails here.
+            await app.initialize()
+            bot_user = await app.bot.get_me()
+            bot_id = bot_user.id
+
+            active_ids = {
+                running_id for running_id in (
+                    _safe_bot_id(bot) for bot in list.__iter__(bots)
+                ) if running_id is not None
+            }
+            if bot_id in active_ids:
+                raise CloneBotError('⚠️ Ye bot pehle se hosted hai.')
+
+            await app.start()
+            await app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=['message', 'callback_query'],
+                poll_interval=0.0,
+                timeout=10,
+            )
+            _persist_cloned_bot(token, bot_id, owner_id)
+        except CloneBotError:
+            await _shutdown_cloned_app(app)
+            raise
+        except Exception as exc:
+            await _shutdown_cloned_app(app)
+            logging.error(
+                'Clone startup failed for bot id %s: %s',
+                token.split(':', 1)[0], type(exc).__name__
+            )
+            raise CloneBotError(
+                '❌ Bot start nahi hua. Token revoke hua ho sakta hai ya bot kahin aur polling par chal raha hai.'
+            ) from None
+
+        # Publish the app to the running registries only after startup and
+        # persistence both succeed.
+        TOKENS.append(token)
+        CLONE_OWNERS[bot_id] = owner_id
+        apps.append(app)
+        bots.append(app.bot)
+        return bot_user
+
+
+async def clone_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Public command: securely clone the script onto a supplied bot token."""
+    if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text(
+            '🔒 Bot token group mein mat bhejo. Mujhe private chat mein /clone <BOT_TOKEN> bhejo.'
+        )
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            '🧬 Apna bot yahan host karo\n\n'
+            '1. @BotFather se token lo\n'
+            '2. Private chat mein bhejo: /clone <BOT_TOKEN>\n\n'
+            '⚠️ Token kisi public group mein kabhi share mat karna.'
+        )
+        return
+
+    token = context.args[0].strip()
+
+    # Remove the message containing the secret as soon as we have copied it.
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    status = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text='🔄 Token verify karke bot start kar raha hoon...'
+    )
+
+    if not _BOT_TOKEN_RE.fullmatch(token):
+        await status.edit_text('❌ Invalid bot token format. @BotFather se naya token copy karo.')
+        return
+
+    try:
+        bot_user = await start_cloned_bot(token, update.effective_user.id)
+    except CloneBotError as exc:
+        await status.edit_text(str(exc))
+        return
+
+    username = f'@{bot_user.username}' if bot_user.username else bot_user.full_name
+    await status.edit_text(
+        '✅ Bot clone live ho gaya!\n'
+        f'🤖 Bot: {username}\n'
+        '🚀 Restart ki zarurat nahi — polling abhi start ho chuki hai.\n'
+        '🔐 Aap apne cloned bot par protected commands chala sakte ho.\n\n'
+        f'Ab {username} ko open karke /start bhejo.'
+    )
+
+
+# ===========================================================
+# ADD TOKEN — /addtoken (owner only, legacy restart-based command)
 # ===========================================================
 @owner_only
 async def addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3458,7 +3737,10 @@ async def pfpswipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP / START
 # ===========================================================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_owner_or_sudo(update.effective_user.id):
+    uid = update.effective_user.id
+    bot_id = _context_bot_id(context)
+    if is_owner_or_sudo(uid, bot_id):
+        visible_bot_count = len(bots) if _is_global_operator(uid) else 1
         delta = datetime.now() - BOT_START_TIME
         uptime_str = f"{delta.days}d {delta.seconds//3600}h {(delta.seconds%3600)//60}m"
         help_text = (
@@ -3466,7 +3748,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "┃  👑 𝐗𝐄𝐑𝐎𝐍𝐁𝐄𝐀𝐒𝐓𝐒𝐂𝐑𝐈𝐏𝐓 👑  ┃\n"
             "┃  ⚡ 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗘𝗗𝗜𝗧𝗜𝗢𝗡 v3.0 ⚡  ┃\n"
             "┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
-            f"🤖 𝗕𝗼𝘁𝘀: {len(bots)}  ⏱️ 𝗨𝗽: {uptime_str}  ⚡ 𝗗𝗲𝗹𝗮𝘆: {GLOBAL_DELAY:.3f}s\n"
+            f"🤖 𝗕𝗼𝘁𝘀: {visible_bot_count}  ⏱️ 𝗨𝗽: {uptime_str}  ⚡ 𝗗𝗲𝗹𝗮𝘆: {GLOBAL_DELAY:.3f}s\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "╭─🌐 𝗟𝗔𝗡𝗚𝗨𝗔𝗚𝗘 𝗡𝗖 ──────────╮\n"
             "│ 🩸 /hindinc   🔥 /biharinc  │\n"
@@ -3543,6 +3825,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "│ 🤝/allbotadd <gc_link>         │\n"
             "│ 🚪/leaveall [chat_id]          │\n"
             "│ 👤/adduser  🔑/addtoken        │\n"
+            "│ 🧬/clone <token> (private only)│\n"
             "│ 🚀/startall <text>             │\n"
             "│ 🔥/burn (reply to report)      │\n"
             "╰──────────────────────────╯\n"
@@ -3560,6 +3843,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
             "🚫 𝗧𝘂 𝗦𝘂𝗱𝗼 𝗡𝗮𝗵𝗶 𝗛𝗮𝗶 𝗕𝗵𝗮𝗶 💀\n"
             "🔒 𝗣𝗲𝗵𝗹𝗲 𝗦𝘂𝗱𝗼 𝗟𝗲 𝗔𝗮𝗼 𝗙𝗶𝗿 𝗔𝗮𝗻𝗮 😈\n"
+            "🧬 Apna bot host karna hai? Private mein /clone <BOT_TOKEN> bhejo.\n"
             "⚡ 𝐗𝐄𝐑𝐎𝐍𝐁𝐄𝐀𝐒𝐓𝐒𝐂𝐑𝐈𝐏𝐓 🔱"
         )
 
@@ -3579,8 +3863,14 @@ async def auto_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
+    # Passive handlers on a user-owned clone must never fan out through bots
+    # belonging to other users.
+    passive_bots = (
+        [context.bot] if _context_bot_id(context) in CLONE_OWNERS else list(bots)
+    )
+
     async def _do_react(emoji):
-        for b in bots:
+        for b in passive_bots:
             try:
                 await b.set_message_reaction(
                     chat_id=cid,
@@ -3599,7 +3889,7 @@ async def auto_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # AutoReply — slide2 style reply on every message from target user
     if cid in autoreply_users and uid in autoreply_users[cid]:
-        _ar_bots = bots  # local ref — avoids global lookup per bot
+        _ar_bots = passive_bots  # clone-safe local target list
         async def _do_autoreply(message_id=msg.message_id, chat=cid, user=uid):
             idx = autoreply_slide2_idx.get(chat, {}).get(user, 0)
             text = SLIDE2_MESSAGES[idx % len(SLIDE2_MESSAGES)]
@@ -3761,6 +4051,7 @@ def build_app(token):
     app.add_handler(CommandHandler("startall", startall))
     app.add_handler(CommandHandler("adduser", adduser))
     app.add_handler(CommandHandler("addtoken", addtoken))
+    app.add_handler(CommandHandler("clone", clone_bot))
     app.add_handler(CommandHandler("goodncraid", goodncraid))
     app.add_handler(CommandHandler("purgeoff", purgeoff))
     app.add_handler(CommandHandler("refresh", refresh))
