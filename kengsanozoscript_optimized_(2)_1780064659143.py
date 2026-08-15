@@ -106,6 +106,10 @@ except (OSError, ValueError, TypeError, json.JSONDecodeError) as _e:
 if not TOKENS:
     raise SystemExit('ERROR: No bot tokens found!')
 
+# The first configured token is the single control-plane bot.  Keep this
+# immutable when dynamically cloned bots are appended to ``TOKENS``.
+LEAD_BOT_TOKEN = TOKENS[0]
+
 # ===========================================================
 # GEMINI AI CONFIG — Multi-key rotation (429 se bachne ke liye)
 # ===========================================================
@@ -314,6 +318,27 @@ def _context_bot_id(context):
         return context.bot.id
     except (AttributeError, RuntimeError):
         return None
+
+
+def _is_lead_bot(context):
+    """Return True only when this update was received by the lead bot."""
+    try:
+        return context.bot.token == LEAD_BOT_TOKEN
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def lead_bot_only(func):
+    """Runtime backstop for commands that must never execute on a clone."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if _is_lead_bot(context):
+            return await func(update, context)
+        if update.message:
+            await update.message.reply_text(
+                "🚫 Ye command sirf lead bot par available hai."
+            )
+    return wrapper
 
 
 def is_owner_or_sudo(uid, bot_id=None):
@@ -2061,8 +2086,9 @@ async def start_cloned_bot(token, owner_id):
         return bot_user
 
 
+@lead_bot_only
 async def clone_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Public command: securely clone the script onto a supplied bot token."""
+    """Lead-only command that securely hosts a supplied bot token."""
     if not update.effective_chat or update.effective_chat.type != ChatType.PRIVATE:
         await update.message.reply_text(
             '🔒 Bot token group mein mat bhejo. Mujhe private chat mein /clone <BOT_TOKEN> bhejo.'
@@ -3297,132 +3323,75 @@ async def stopautoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Koi autoreply chal nahi raha is chat mein!")
 
 # ===========================================================
-# ALL BOT ADD + AUTO ADMIN
+# ADD ALL RUNNING BOTS — lead bot + OWNER only
 # ===========================================================
-@owner_only
-async def allbotadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text(
-            "╔══════════════════╗\n"
-            "║  ⚡ 𝗔𝗟𝗟𝗕𝗢𝗧𝗔𝗗𝗗 ⚡  ║\n"
-            "╚══════════════════╝\n"
-            "❌ GC link do bhai!\n"
-            "📌 Usage: /allbotadd <invite_link>\n"
-            "⚡ Xҽɾσɳ Bҽαʂƚ Pαρα 🔱"
-        )
+ADDALLBOTS_BATCH_SIZE = 8
+BOT_ADMIN_DEEP_LINK_RIGHTS = "+".join((
+    "change_info", "delete_messages", "restrict_members", "invite_users",
+    "pin_messages", "promote_members", "manage_video_chats", "manage_chat",
+))
 
-    invite_link = context.args[0].strip()
-    if not (invite_link.startswith('https://t.me/') or invite_link.startswith('t.me/')):
-        return await update.message.reply_text(
-            "❌ Invalid link! Use a valid Telegram group invite link.\n"
-            "📌 Example: https://t.me/+xxxxxxxx"
-        )
 
-    status_msg = await update.message.reply_text(
-        "╔══════════════════╗\n"
-        "║  ⚡ 𝗔𝗟𝗟𝗕𝗢𝗧𝗔𝗗𝗗 ⚡  ║\n"
-        "╚══════════════════╝\n"
-        f"🔗 Link: {invite_link}\n"
-        f"🤖 Total Bots: {len(bots)}\n"
-        "🔄 Sare bots join kar rahe hain..."
-    )
-
-    joined_bots = []
-    failed_join = []
-    chat_id = None
-
-    # Step 1: All bots join the group
-    for bot in bots:
+def _running_bot_add_buttons():
+    """Build one official add-to-group button for each polling bot."""
+    buttons = []
+    seen_bot_ids = set()
+    for app in apps:
         try:
-            chat = await bot.join_chat(invite_link)
-            if chat_id is None:
-                chat_id = chat.id
-            joined_bots.append(bot)
-            await asyncio.sleep(0.02)
-        except Exception as e:
-            err_str = str(e).lower()
-            # Bot might already be in the group
-            if 'already' in err_str or 'user_already' in err_str:
-                joined_bots.append(bot)
-                # Try to get chat_id via getUpdates workaround
-                if chat_id is None:
-                    try:
-                        # Try resolving chat from link
-                        username_part = invite_link.split('t.me/')[-1].lstrip('+')
-                        if not invite_link.split('t.me/')[-1].startswith('+'):
-                            ch = await bot.get_chat(f"@{username_part}")
-                            chat_id = ch.id
-                    except Exception:
-                        pass
-            else:
-                failed_join.append(f"❌ Bot {str(bot.id)[:8]}... — {str(e)[:40]}")
-            await asyncio.sleep(0.05)
+            if not app.running or not app.updater or not app.updater.running:
+                continue
+            bot = app.bot
+            bot_id = bot.id
+            username = bot.username
+        except (AttributeError, RuntimeError):
+            continue
 
-    if not joined_bots or chat_id is None:
-        return await status_msg.edit_text(
-            "❌ Koi bot join nahi kar saka ya chat ID nahi mila!\n"
-            "🔑 Check karo link valid ho aur bots banned na hon.\n\n"
-            + "\n".join(failed_join[:5])
+        if not username or bot_id in seen_bot_ids:
+            continue
+        seen_bot_ids.add(bot_id)
+        username = username.lstrip('@')
+        add_url = (
+            f"https://t.me/{username}?startgroup&admin="
+            f"{BOT_ADMIN_DEEP_LINK_RIGHTS}"
+        )
+        buttons.append(InlineKeyboardButton(
+            text=f"➕ @{username} ko admin add karein",
+            url=add_url,
+        ))
+    return buttons
+
+
+@lead_bot_only
+@owner_only
+async def addallbots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send batched admin add-to-group links for every running bot."""
+    buttons = _running_bot_add_buttons()
+    if not buttons:
+        await update.message.reply_text(
+            "❌ Abhi koi running bot add karne ke liye available nahi hai."
+        )
+        return
+
+    total_batches = (len(buttons) + ADDALLBOTS_BATCH_SIZE - 1) // ADDALLBOTS_BATCH_SIZE
+    for offset in range(0, len(buttons), ADDALLBOTS_BATCH_SIZE):
+        batch = buttons[offset:offset + ADDALLBOTS_BATCH_SIZE]
+        batch_number = offset // ADDALLBOTS_BATCH_SIZE + 1
+        keyboard = InlineKeyboardMarkup([[button] for button in batch])
+        await update.message.reply_text(
+            "🤖 *Running bots ko group mein add karein*\n\n"
+            "Telegram Bot API bots ko invite link se khud join/accept karne "
+            "nahi deta. Har button tap karke group choose karein aur requested "
+            "admin permissions confirm karein.\n\n"
+            f"📦 Batch {batch_number}/{total_batches} • "
+            f"Bots {offset + 1}-{offset + len(batch)} of {len(buttons)}",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
         )
 
-    await status_msg.edit_text(
-        f"✅ {len(joined_bots)}/{len(bots)} bots joined!\n"
-        f"🔄 Ab admin promote ho raha hai..."
-    )
 
-    # Step 2: Promote all joined bots to admin
-    permissions = {
-        'can_change_info': True, 'can_post_messages': True, 'can_edit_messages': True,
-        'can_delete_messages': True, 'can_invite_users': True, 'can_restrict_members': True,
-        'can_pin_messages': True, 'can_promote_members': True, 'can_manage_video_chats': True,
-        'can_manage_chat': True
-    }
-
-    promoted = []
-    failed_promote = []
-
-    for promoter in joined_bots:
-        for target in joined_bots:
-            if promoter.id == target.id:
-                continue
-            try:
-                await promoter.promote_chat_member(chat_id=chat_id, user_id=target.id, **permissions)
-                if target.id not in [b.id for b in promoted]:
-                    promoted.append(target)
-                await asyncio.sleep(0.02)
-                break
-            except Exception:
-                await asyncio.sleep(0.05)
-                continue
-
-    # Also try promoting all from first joined bot
-    if joined_bots:
-        first_bot = joined_bots[0]
-        for target in joined_bots[1:]:
-            if target.id in [b.id for b in promoted]:
-                continue
-            try:
-                await first_bot.promote_chat_member(chat_id=chat_id, user_id=target.id, **permissions)
-                promoted.append(target)
-                await asyncio.sleep(0.02)
-            except Exception as e:
-                failed_promote.append(f"⚠️ Bot {str(target.id)[:8]}... — {str(e)[:30]}")
-
-    result = (
-        "╔══════════════════╗\n"
-        "║  ✅ 𝗔𝗟𝗟𝗕𝗢𝗧𝗔𝗗𝗗 𝗗𝗢𝗡𝗘 ✅  ║\n"
-        "╚══════════════════╝\n"
-        f"🤖 Joined: {len(joined_bots)}/{len(bots)} bots\n"
-        f"👑 Admin bane: {len(promoted)} bots\n"
-        f"🏠 Chat ID: {chat_id}\n"
-    )
-    if failed_join:
-        result += f"\n⚠️ Join fail ({len(failed_join)}):\n" + "\n".join(failed_join[:3])
-    if failed_promote:
-        result += f"\n⚠️ Promote fail ({len(failed_promote)}):\n" + "\n".join(failed_promote[:3])
-    result += "\n⚡ Xҽɾσɳ Bҽαʂƚ Pαρα 🔱"
-
-    await status_msg.edit_text(result)
+# Backwards-compatible command/callback name.  Both command aliases are
+# registered only on the lead bot in ``build_app``.
+allbotadd = addallbots
 
 # ===========================================================
 # REACT LOOP
@@ -3739,10 +3708,24 @@ async def pfpswipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     bot_id = _context_bot_id(context)
+    on_lead_bot = _is_lead_bot(context)
     if is_owner_or_sudo(uid, bot_id):
         visible_bot_count = len(bots) if _is_global_operator(uid) else 1
         delta = datetime.now() - BOT_START_TIME
         uptime_str = f"{delta.days}d {delta.seconds//3600}h {(delta.seconds%3600)//60}m"
+        lead_help_text = ""
+        if on_lead_bot:
+            addallbots_help = (
+                "│ 🤖 /addallbots  (alias /allbotadd) │\n"
+                if uid == OWNER_ID else ""
+            )
+            lead_help_text = (
+                "╭─⭐ 𝗟𝗘𝗔𝗗 𝗕𝗢𝗧 𝗢𝗡𝗟𝗬 ─────────╮\n"
+                "│ 🧬 /clone <token>              │\n"
+                "│ 🪞 /mirror <token>             │\n"
+                f"{addallbots_help}"
+                "╰──────────────────────────╯\n"
+            )
         help_text = (
             "┏━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
             "┃  👑 𝐗𝐄𝐑𝐎𝐍𝐁𝐄𝐀𝐒𝐓𝐒𝐂𝐑𝐈𝐏𝐓 👑  ┃\n"
@@ -3822,13 +3805,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "│ 🔱/godmode  🛑/stopgodmode     │\n"
             "│ ➕/addsudo  ➖/delsudo  📋/sudos│\n"
             "│ 🔑/admin  👀/checkadmin  👋/bye│\n"
-            "│ 🤝/allbotadd <gc_link>         │\n"
             "│ 🚪/leaveall [chat_id]          │\n"
             "│ 👤/adduser  🔑/addtoken        │\n"
-            "│ 🧬/clone <token> (private only)│\n"
             "│ 🚀/startall <text>             │\n"
             "│ 🔥/burn (reply to report)      │\n"
             "╰──────────────────────────╯\n"
+            f"{lead_help_text}"
             "╭─💬 𝗔𝗨𝗧𝗢 𝗥𝗘𝗣𝗟𝗬 ──────────╮\n"
             "│ 💬/autoreply  🛑/stopautoreply  │\n"
             "╰──────────────────────────╯\n"
@@ -3837,13 +3819,18 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(help_text)
     else:
+        public_lead_help = (
+            "🧬 Bot host: /clone <BOT_TOKEN>\n"
+            "🪞 Alias: /mirror <BOT_TOKEN>\n"
+            if on_lead_bot else ""
+        )
         await update.message.reply_text(
             "┏━━━━━━━━━━━━━━━━━━━━━━━┓\n"
             "┃  👑 𝐗𝐄𝐑𝐎𝐍𝐁𝐄𝐀𝐒𝐓𝐒𝐂𝐑𝐈𝐏𝐓  ┃\n"
             "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n"
             "🚫 𝗧𝘂 𝗦𝘂𝗱𝗼 𝗡𝗮𝗵𝗶 𝗛𝗮𝗶 𝗕𝗵𝗮𝗶 💀\n"
             "🔒 𝗣𝗲𝗵𝗹𝗲 𝗦𝘂𝗱𝗼 𝗟𝗲 𝗔𝗮𝗼 𝗙𝗶𝗿 𝗔𝗮𝗻𝗮 😈\n"
-            "🧬 Apna bot host karna hai? Private mein /clone <BOT_TOKEN> bhejo.\n"
+            f"{public_lead_help}"
             "⚡ 𝐗𝐄𝐑𝐎𝐍𝐁𝐄𝐀𝐒𝐓𝐒𝐂𝐑𝐈𝐏𝐓 🔱"
         )
 
@@ -4042,7 +4029,6 @@ def build_app(token):
     # Admin Management
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("checkadmin", checkadmin))
-    app.add_handler(CommandHandler("allbotadd", allbotadd))
     app.add_handler(CommandHandler("leaveall", leaveall))
     app.add_handler(CommandHandler("autoreply", autoreply))
     app.add_handler(CommandHandler("stopautoreply", stopautoreply))
@@ -4051,7 +4037,15 @@ def build_app(token):
     app.add_handler(CommandHandler("startall", startall))
     app.add_handler(CommandHandler("adduser", adduser))
     app.add_handler(CommandHandler("addtoken", addtoken))
-    app.add_handler(CommandHandler("clone", clone_bot))
+
+    # Control-plane commands must not even be registered on secondary bots.
+    # Runtime decorators on both callbacks provide a second layer of safety.
+    if token == LEAD_BOT_TOKEN:
+        app.add_handler(CommandHandler("clone", clone_bot))
+        app.add_handler(CommandHandler("mirror", clone_bot))
+        app.add_handler(CommandHandler("addallbots", addallbots))
+        app.add_handler(CommandHandler("allbotadd", addallbots))
+
     app.add_handler(CommandHandler("goodncraid", goodncraid))
     app.add_handler(CommandHandler("purgeoff", purgeoff))
     app.add_handler(CommandHandler("refresh", refresh))
