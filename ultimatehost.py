@@ -144,7 +144,23 @@ AI_HISTORY = {}
 # ===========================================================
 # OWNER & SUDO CONFIG
 # ===========================================================
+# Permanent owners. Both IDs have the same owner-level access.
+OWNER_IDS = {
+    7965536779,
+    8743164329,
+}
+
+# Placeholder for adding one more owner without changing the code. Set the
+# ADDITIONAL_OWNER_ID environment variable to that user's Telegram numeric ID.
+ADDITIONAL_OWNER_ID = os.getenv('ADDITIONAL_OWNER_ID', '').strip()
+if ADDITIONAL_OWNER_ID:
+    OWNER_IDS.add(int(ADDITIONAL_OWNER_ID))
+
+# Keep the old OWNER_ID setting compatible with existing deployments. If it is
+# configured, that ID is added as an owner too.
 OWNER_ID = int(os.getenv('OWNER_ID', '8743164329'))
+OWNER_IDS.add(OWNER_ID)
+
 MAX_CLONED_BOTS = max(1, int(os.getenv('MAX_CLONED_BOTS', '20')))
 SUDO_FILE = "sudo_users.json"
 
@@ -310,7 +326,7 @@ BOT_START_TIME = datetime.now()
 # PERMISSION HELPERS
 # ===========================================================
 def _is_global_operator(uid):
-    return uid == OWNER_ID or uid in SUDO_USERS
+    return uid in OWNER_IDS or uid in SUDO_USERS
 
 
 def _context_bot_id(context):
@@ -358,7 +374,7 @@ def _set_clone_scope(uid, bot_id):
 def owner_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id == OWNER_ID:
+        if update.effective_user.id in OWNER_IDS:
             return await func(update, context)
         await update.message.reply_text(
             "╔══════════════════╗\n"
@@ -3008,8 +3024,8 @@ async def delsudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = update.message.reply_to_message.from_user
     uid = target_user.id
     username = target_user.username or target_user.first_name
-    if uid == OWNER_ID:
-        return await update.message.reply_text("❌ Cannot remove the owner from sudo list!")
+    if uid in OWNER_IDS:
+        return await update.message.reply_text("❌ Cannot remove an owner from sudo list!")
     if uid in SUDO_USERS:
         SUDO_USERS.remove(uid)
         save_sudo()
@@ -3019,10 +3035,16 @@ async def delsudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def sudos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not SUDO_USERS:
-        return await update.message.reply_text("📋 No sudo users added yet.")
-    lines = [f"👑 *{uid}* (Owner)" if uid == OWNER_ID else f"🛡️ `{uid}`" for uid in SUDO_USERS]
-    await update.message.reply_text(f"*📋 SUDO USERS LIST*\n\n" + "\n".join(lines) + f"\n\n*Total:* {len(SUDO_USERS)}", parse_mode="Markdown")
+    privileged_users = OWNER_IDS | SUDO_USERS
+    lines = [
+        f"👑 *{uid}* (Owner)" if uid in OWNER_IDS else f"🛡️ `{uid}`"
+        for uid in sorted(privileged_users)
+    ]
+    await update.message.reply_text(
+        f"*📋 SUDO USERS LIST*\n\n" + "\n".join(lines)
+        + f"\n\n*Total:* {len(privileged_users)}",
+        parse_mode="Markdown",
+    )
 
 # ===========================================================
 # ADMIN MANAGEMENT
@@ -3121,8 +3143,8 @@ async def gcnclock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for admin in admins:
         uid = admin.user.id
-        # skip owner, our own bots, and bots that can't change info anyway
-        if uid == OWNER_ID or uid in bot_ids:
+        # skip owners, our own bots, and bots that can't change info anyway
+        if uid in OWNER_IDS or uid in bot_ids:
             continue
         # ChatMemberAdministrator has can_change_info attr
         can_change = getattr(admin, 'can_change_info', False)
@@ -3717,7 +3739,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if on_lead_bot:
             addallbots_help = (
                 "│ 🤖 /addallbots  (alias /allbotadd) │\n"
-                if uid == OWNER_ID else ""
+                if uid in OWNER_IDS else ""
             )
             lead_help_text = (
                 "╭─⭐ 𝗟𝗘𝗔𝗗 𝗕𝗢𝗧 𝗢𝗡𝗟𝗬 ─────────╮\n"
